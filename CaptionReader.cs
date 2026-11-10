@@ -62,7 +62,9 @@ sealed class CaptionReader
         _transcript = new StreamWriter(new FileStream(CurrentTranscriptPath, FileMode.Append, FileAccess.Write, FileShare.ReadWrite)) { AutoFlush = true };
 
         // Anything already on screen when you press Start is skipped.
-        var saved = CaptionText.Baseline(await Task.Run(ReadCaptions));
+        var startText = await Task.Run(ReadCaptions);
+        var saved = CaptionText.Baseline(startText);
+        Debug($"--- start {DateTime.Now:yyyy-MM-dd} | window found: {_window is not null} | text block found: {_textBlock is not null} | hidden: {hideCaptionsWindow} | {startText.Length} chars on screen");
 
         _cts = new CancellationTokenSource();
         var token = _cts.Token;
@@ -89,11 +91,33 @@ sealed class CaptionReader
     private async Task PollLoop(List<string> saved, CancellationToken token)
     {
         var lastInProgress = "";
+        var lastRaw = "";
+        var lastFinished = "";
+        var lastFinishedSince = DateTime.UtcNow;
         while (!token.IsCancellationRequested)
         {
-            var sentences = CaptionText.SplitSentences(ReadCaptions());
-            var (settled, inProgress) = CaptionText.Settle(sentences);
+            var raw = ReadCaptions();
+            var sentences = CaptionText.SplitSentences(raw);
+
+            // Live Captions may only keep a sentence or two, so don't wait for the next sentence:
+            // save the newest finished one once it has stayed the same for 1.5 seconds.
+            var finished = CaptionText.LastFinished(sentences);
+            if (CaptionText.Normalize(finished) != CaptionText.Normalize(lastFinished))
+            {
+                lastFinished = finished;
+                lastFinishedSince = DateTime.UtcNow;
+            }
+
+            var stable = finished.Length > 0 && DateTime.UtcNow - lastFinishedSince >= TimeSpan.FromSeconds(1.5);
+            var (settled, inProgress) = CaptionText.Settle(sentences, stable);
+            var before = LinesSaved;
             Save(saved, settled);
+
+            if (raw != lastRaw)
+            {
+                lastRaw = raw;
+                Debug($"read {raw.Length} chars, {sentences.Count} sentences, {settled.Count} ready, saved {LinesSaved - before} new | start: \"{Clip(raw, 0, 40)}\" | end: \"{Clip(raw, raw.Length - 60, 60)}\"");
+            }
 
             if (inProgress != lastInProgress)
             {
@@ -112,8 +136,37 @@ sealed class CaptionReader
         }
 
         // On Stop, save everything left, including the sentence that was still in progress.
+        var beforeStop = LinesSaved;
         Save(saved, CaptionText.SplitSentences(ReadCaptions()));
+        Debug($"stop: saved {LinesSaved - beforeStop} more");
         InProgress?.Invoke("");
+        _debug?.Dispose();
+        _debug = null;
+    }
+
+    // ---------------- diagnostic log ----------------
+    // Writes what Live Captions returned to caption-debug.log in the Records folder,
+    // one line each time the caption text changes. Safe to delete anytime.
+
+    private StreamWriter? _debug;
+
+    private void Debug(string message)
+    {
+        try
+        {
+            _debug ??= new StreamWriter(Path.Combine(TranscriptDir, "caption-debug.log"), append: true) { AutoFlush = true };
+            _debug.WriteLine($"{DateTime.Now:HH:mm:ss.f} {message}");
+        }
+        catch (IOException)
+        {
+        }
+    }
+
+    private static string Clip(string text, int start, int length)
+    {
+        start = Math.Max(0, start);
+        length = Math.Min(length, text.Length - start);
+        return length <= 0 ? "" : text.Substring(start, length).Replace("\r", " ").Replace("\n", " / ");
     }
 
     private void Save(List<string> saved, List<string> candidates)

@@ -25,12 +25,21 @@ static class CaptionText
     /// Sentences safe to save now. The sentence being spoken, plus the last finished one
     /// (Live Captions sometimes still fixes it), are held back until later.
     /// </summary>
-    public static (List<string> Settled, string InProgress) Settle(List<string> sentences)
+    public static (List<string> Settled, string InProgress) Settle(List<string> sentences, bool lastFinishedIsStable = false)
     {
         var lastIsComplete = sentences.Count > 0 && ".!?".Contains(sentences[^1][^1]);
         var complete = lastIsComplete ? sentences.Count : sentences.Count - 1;
-        var settledCount = Math.Max(0, complete - 1);
+        // The newest finished sentence is held back until it has stopped changing.
+        var settledCount = lastFinishedIsStable ? Math.Max(0, complete) : Math.Max(0, complete - 1);
         return (sentences.Take(settledCount).ToList(), string.Join(" ", sentences.Skip(settledCount)));
+    }
+
+    /// <summary>The newest finished sentence, or "" if there isn't one.</summary>
+    public static string LastFinished(List<string> sentences)
+    {
+        var lastIsComplete = sentences.Count > 0 && ".!?".Contains(sentences[^1][^1]);
+        var complete = lastIsComplete ? sentences.Count : sentences.Count - 1;
+        return complete > 0 ? sentences[complete - 1] : "";
     }
 
     /// <summary>Finished sentences only (used as the starting point when you press Start, so older text isn't saved).</summary>
