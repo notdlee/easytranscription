@@ -114,8 +114,9 @@ sealed class Assistant
     // ======================= Training notes / summary =======================
 
     private const string TranscriptNote =
-        "The transcript comes from live speech-to-text, so expect misheard words and missing punctuation. " +
-        "[ME] is the person recording; [THEM] is audio from their computer (team leader, callers, or clients). These labels can be wrong.\n";
+        "The transcript comes from Windows Live Captions of a shadowed call (the team leader and the caller), " +
+        "so expect misheard words. Speakers are not labeled; work out who is talking from context. " +
+        "Older transcripts may have [ME]/[THEM] labels, which can be wrong.\n";
 
     private const string TrainingSystem =
         "You help an IT service desk coordinator take notes while shadowing their team leader. " + TranscriptNote +

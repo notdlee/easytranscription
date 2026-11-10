@@ -8,18 +8,18 @@ sealed class MainForm : Form
 {
     private static readonly Color Background = Color.FromArgb(30, 30, 30);
     private static readonly Color TextColor = Color.Gainsboro;
-    private static readonly Color MeColor = Color.LightGreen;
-    private static readonly Color ThemColor = Color.Gold;
+    private static readonly Color AiColor = Color.LightGreen;
     private static readonly Color DimColor = Color.Gray;
     private static readonly Color YouColor = Color.SkyBlue;
     private static readonly Color ErrorColor = Color.IndianRed;
 
-    private readonly Transcriber _transcriber = new();
+    private readonly CaptionReader _captions = new();
     private readonly Assistant _assistant = new();
 
     // Left side
     private readonly Button _startButton = MakeButton("Start", enabled: false);
-    private readonly CheckBox _micOnlyBox = new() { Text = "Mic only", AutoSize = true, Margin = new Padding(8, 9, 3, 3) };
+    private readonly CheckBox _hideCaptionsBox = new() { Text = "Hide Live Captions bar while recording", AutoSize = true, Checked = true, Margin = new Padding(8, 9, 3, 3) };
+    private readonly Label _hearingLabel = new() { Text = "", AutoSize = true, ForeColor = Color.Gray, Margin = new Padding(3, 4, 3, 3), MaximumSize = new Size(600, 0) };
     private readonly Button _folderButton = MakeButton("Open Records folder");
     private readonly Button _correctionsButton = MakeButton("Edit corrections");
     private readonly Label _statusLabel = MakeLabel("Starting up...");
@@ -60,7 +60,9 @@ sealed class MainForm : Form
         Controls.Add(split);
         Load += (_, _) => split.SplitterDistance = ClientSize.Width / 2;
 
-        _transcriber.LineReceived += (label, text) => OnUi(() => AppendTranscriptLine(label, text));
+        _captions.LineSaved += text => OnUi(() => AppendTranscriptLine(text));
+        _captions.InProgress += text => OnUi(() => _hearingLabel.Text = text.Length == 0 ? "" : "Hearing: " + text);
+        _captions.GapDetected += () => OnUi(() => AppendTranscriptNote("[gap: some captions may be missing]", ErrorColor));
 
         _startButton.Click += async (_, _) => await ToggleRecordingAsync();
         _folderButton.Click += (_, _) => OpenRecordsFolder();
@@ -91,7 +93,8 @@ sealed class MainForm : Form
 
         // While recording, show elapsed time and whether audio and text are flowing.
         _recordingTimer.Tick += (_, _) =>
-            _statusLabel.Text = $"Recording {DateTime.Now - _recordingStarted:mm\\:ss}  ·  audio sent: {_transcriber.ChunksSent}  ·  lines: {_transcriber.LinesReceived}";
+            _statusLabel.Text = $"Recording {DateTime.Now - _recordingStarted:mm\\:ss}  ·  lines saved: {_captions.LinesSaved}" +
+                                (_captions.Gaps > 0 ? $"  ·  gaps: {_captions.Gaps}" : "");
 
         Shown += async (_, _) => await StartUpAsync();
         FormClosing += OnFormClosing;
@@ -103,15 +106,17 @@ sealed class MainForm : Form
     private Control BuildLeft()
     {
         var buttons = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Fill, WrapContents = true };
-        buttons.Controls.AddRange(new Control[] { _startButton, _micOnlyBox, _folderButton, _correctionsButton });
+        buttons.Controls.AddRange(new Control[] { _startButton, _hideCaptionsBox, _folderButton, _correctionsButton });
 
-        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 3, Padding = new Padding(6) };
+        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 4, Padding = new Padding(6) };
         layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         layout.Controls.Add(buttons, 0, 0);
         layout.Controls.Add(_statusLabel, 0, 1);
         layout.Controls.Add(_transcriptBox, 0, 2);
+        layout.Controls.Add(_hearingLabel, 0, 3);
         return layout;
     }
 
@@ -166,18 +171,19 @@ sealed class MainForm : Form
     {
         try
         {
-            await Foundry.InitAsync(s => OnUi(() => _statusLabel.Text = s));
+            // Recording only needs Live Captions, so it's ready right away.
+            _startButton.Enabled = true;
+            _statusLabel.Text = "Ready. Press Start when the call begins (uses Windows Live Captions).";
+            _aiStatusLabel.Text = "Setting up Foundry Local...";
+            await Foundry.InitAsync(s => OnUi(() => _aiStatusLabel.Text = s));
             _foundryReady = true;
             SetAiButtonsEnabled(true);
             _aiStatusLabel.Text = $"{_assistant.ModelAlias} loads when you first use it.";
-            await _transcriber.LoadAsync(s => OnUi(() => _statusLabel.Text = s));
-            _statusLabel.Text = "Ready. Press Start when your meeting begins. (Wear headphones.)";
-            _startButton.Enabled = true;
         }
         catch (Exception ex)
         {
-            _statusLabel.ForeColor = ErrorColor;
-            _statusLabel.Text = "Startup failed: " + ex.Message;
+            _aiStatusLabel.ForeColor = ErrorColor;
+            _aiStatusLabel.Text = "Foundry Local setup failed: " + ex.Message;
         }
     }
 
@@ -194,7 +200,7 @@ sealed class MainForm : Form
         try
         {
             _aiCts?.Cancel();
-            await _transcriber.UnloadAsync();
+            await _captions.StopAsync();
             await _assistant.UnloadAsync();
             Foundry.Shutdown();
         }
@@ -214,14 +220,12 @@ sealed class MainForm : Form
         _startButton.Enabled = false;
         try
         {
-            if (!_transcriber.IsRunning)
+            if (!_captions.IsRunning)
             {
-                // Run on a background thread so the speech session isn't tied to the window's
-                // thread (the console version, which streamed live, had no window thread).
-                var micOnly = _micOnlyBox.Checked;
-                await Task.Run(() => _transcriber.StartAsync(micOnly, warning => OnUi(() => AppendTranscriptNote(warning, ErrorColor))));
+                var hide = _hideCaptionsBox.Checked;
+                await Task.Run(() => _captions.StartAsync(hide, s => OnUi(() => _statusLabel.Text = s)));
                 _startButton.Text = "Stop";
-                _micOnlyBox.Enabled = false;
+                _hideCaptionsBox.Enabled = false;
                 _recordingStarted = DateTime.Now;
                 _recordingTimer.Start();
                 AppendTranscriptNote($"— Started {DateTime.Now:t} —", DimColor);
@@ -230,10 +234,10 @@ sealed class MainForm : Form
             {
                 _recordingTimer.Stop();
                 _statusLabel.Text = "Stopping...";
-                await Task.Run(_transcriber.StopAsync);
+                await Task.Run(_captions.StopAsync);
                 _startButton.Text = "Start";
-                _micOnlyBox.Enabled = true;
-                _statusLabel.Text = $"Saved: {_transcriber.CurrentTranscriptPath}";
+                _hideCaptionsBox.Enabled = true;
+                _statusLabel.Text = $"Saved: {_captions.CurrentTranscriptPath}";
                 AppendTranscriptNote($"— Stopped {DateTime.Now:t} —", DimColor);
             }
         }
@@ -247,10 +251,9 @@ sealed class MainForm : Form
         }
     }
 
-    private void AppendTranscriptLine(string label, string text)
+    private void AppendTranscriptLine(string text)
     {
         Append(_transcriptBox, $"{DateTime.Now:HH:mm:ss} ", DimColor);
-        Append(_transcriptBox, $"[{label}] ", label == "ME" ? MeColor : ThemColor);
         Append(_transcriptBox, text + Environment.NewLine, TextColor);
     }
 
@@ -259,13 +262,13 @@ sealed class MainForm : Form
 
     private void OpenRecordsFolder()
     {
-        Directory.CreateDirectory(Transcriber.TranscriptDir);
-        Process.Start("explorer.exe", Transcriber.TranscriptDir);
+        Directory.CreateDirectory(CaptionReader.TranscriptDir);
+        Process.Start("explorer.exe", CaptionReader.TranscriptDir);
     }
 
     private void OpenCorrections()
     {
-        var path = Transcriber.CorrectionsPath;
+        var path = CaptionReader.CorrectionsPath;
         if (!File.Exists(path))
         {
             File.WriteAllText(path,
@@ -281,7 +284,7 @@ sealed class MainForm : Form
 
     private void UseCurrentMeeting()
     {
-        if (_transcriber.CurrentTranscriptPath is { } path && File.Exists(path))
+        if (_captions.CurrentTranscriptPath is { } path && File.Exists(path))
         {
             SetSource(path);
         }
@@ -295,7 +298,7 @@ sealed class MainForm : Form
     {
         using var dialog = new OpenFileDialog
         {
-            InitialDirectory = Directory.Exists(Transcriber.TranscriptDir) ? Transcriber.TranscriptDir : null,
+            InitialDirectory = Directory.Exists(CaptionReader.TranscriptDir) ? CaptionReader.TranscriptDir : null,
             Filter = "Transcripts (*.txt)|*.txt",
             Title = "Pick a transcript"
         };
@@ -336,7 +339,7 @@ sealed class MainForm : Form
         await RunAiAsync(async ct =>
         {
             var transcript = _sourcePath is null ? null : Assistant.ReadTranscript(_sourcePath);
-            AppendChat("AI: ", MeColor, newLine: false);
+            AppendChat("AI: ", AiColor, newLine: false);
             var answer = await _assistant.AskAsync(transcript, _history, question, t => OnUi(() => AppendChat(t, TextColor, newLine: false)), ct);
             AppendChat("", TextColor);
             _history.Add(ChatMessage.FromUser(question));
@@ -351,7 +354,7 @@ sealed class MainForm : Form
             return;
         }
 
-        var path = _sourcePath ?? _transcriber.CurrentTranscriptPath;
+        var path = _sourcePath ?? _captions.CurrentTranscriptPath;
         if (path is null || !File.Exists(path))
         {
             AppendChat("Pick a transcript first: Use current meeting, or Open transcript...", ErrorColor);

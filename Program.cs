@@ -1,12 +1,13 @@
-// Meeting Assistant — live meeting transcription + a local chat model, all on-device.
+// Meeting Assistant — saves Windows Live Captions as a transcript + a local chat model, all on-device.
 //
 // Based on Microsoft's "11-foundrylocal-live-transcription" sample (MIT license, see LICENSE).
 // Files:
 //   Program.cs      – starts the app
 //   MainForm.cs     – the window (buttons, transcript, chat)
-//   Transcriber.cs  – mic + PC audio capture and live speech-to-text
+//   CaptionReader.cs – reads Windows Live Captions and saves each finished sentence
+//   CaptionText.cs   – works out which caption sentences are new and finished
 //   Assistant.cs    – phi-4-mini chat, summaries and training notes
-//   Foundry.cs      – one-time Foundry Local setup shared by both models
+//   Foundry.cs      – one-time Foundry Local setup for the chat model
 
 namespace MeetingAssistant;
 
