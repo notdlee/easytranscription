@@ -37,6 +37,10 @@ sealed class Transcriber
     private List<(Regex Heard, string Correct)> _corrections = new();
     private readonly object _writeLock = new();
 
+    private long _chunksSent, _linesReceived;
+    public long ChunksSent => Interlocked.Read(ref _chunksSent);
+    public long LinesReceived => Interlocked.Read(ref _linesReceived);
+
     public string? CurrentTranscriptPath { get; private set; }
     public bool IsRunning => _session is not null;
 
@@ -73,6 +77,8 @@ sealed class Transcriber
         }
 
         _corrections = LoadCorrections(CorrectionsPath);
+        Interlocked.Exchange(ref _chunksSent, 0);
+        Interlocked.Exchange(ref _linesReceived, 0);
 
         Directory.CreateDirectory(TranscriptDir);
         CurrentTranscriptPath = Path.Combine(TranscriptDir, $"meeting_{DateTime.Now:yyyy-MM-dd_HHmm}.txt");
@@ -92,6 +98,7 @@ sealed class Transcriber
             await foreach (var chunk in channel.Reader.ReadAllAsync())
             {
                 await session.AppendAsync(chunk);
+                Interlocked.Increment(ref _chunksSent);
             }
         });
 
@@ -108,6 +115,7 @@ sealed class Transcriber
                         continue;
                     }
 
+                    Interlocked.Increment(ref _linesReceived);
                     text = ApplyCorrections(text, _corrections);
                     var label = micOnly || loudness.MicWasLouder(result.StartTime, result.EndTime) ? "ME" : "THEM";
                     lock (_writeLock)

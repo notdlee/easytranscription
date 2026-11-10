@@ -38,6 +38,8 @@ sealed class MainForm : Form
     private readonly Button _sendButton = MakeButton("Send");
 
     private readonly System.Windows.Forms.Timer _idleTimer = new() { Interval = 10 * 60 * 1000 };
+    private readonly System.Windows.Forms.Timer _recordingTimer = new() { Interval = 1000 };
+    private DateTime _recordingStarted;
     private readonly List<ChatMessage> _history = new();
     private string? _sourcePath;        // transcript being chatted about (null = general chat)
     private CancellationTokenSource? _aiCts;
@@ -86,6 +88,10 @@ sealed class MainForm : Form
                 _aiStatusLabel.Text = $"{_assistant.ModelAlias} unloaded to free memory (reloads when you use it).";
             }
         };
+
+        // While recording, show elapsed time and whether audio and text are flowing.
+        _recordingTimer.Tick += (_, _) =>
+            _statusLabel.Text = $"Recording {DateTime.Now - _recordingStarted:mm\\:ss}  ·  audio sent: {_transcriber.ChunksSent}  ·  lines: {_transcriber.LinesReceived}";
 
         Shown += async (_, _) => await StartUpAsync();
         FormClosing += OnFormClosing;
@@ -210,16 +216,21 @@ sealed class MainForm : Form
         {
             if (!_transcriber.IsRunning)
             {
-                await _transcriber.StartAsync(_micOnlyBox.Checked, warning => OnUi(() => AppendTranscriptNote(warning, ErrorColor)));
+                // Run on a background thread so the speech session isn't tied to the window's
+                // thread (the console version, which streamed live, had no window thread).
+                var micOnly = _micOnlyBox.Checked;
+                await Task.Run(() => _transcriber.StartAsync(micOnly, warning => OnUi(() => AppendTranscriptNote(warning, ErrorColor))));
                 _startButton.Text = "Stop";
                 _micOnlyBox.Enabled = false;
-                _statusLabel.Text = $"Recording... saving to {_transcriber.CurrentTranscriptPath}";
+                _recordingStarted = DateTime.Now;
+                _recordingTimer.Start();
                 AppendTranscriptNote($"— Started {DateTime.Now:t} —", DimColor);
             }
             else
             {
+                _recordingTimer.Stop();
                 _statusLabel.Text = "Stopping...";
-                await _transcriber.StopAsync();
+                await Task.Run(_transcriber.StopAsync);
                 _startButton.Text = "Start";
                 _micOnlyBox.Enabled = true;
                 _statusLabel.Text = $"Saved: {_transcriber.CurrentTranscriptPath}";
