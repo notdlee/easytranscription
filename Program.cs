@@ -2,9 +2,10 @@
 //
 // Based on Microsoft's "11-foundrylocal-live-transcription" sample (MIT license,
 // see LICENSE). Changes from the original:
-//   - Captures your microphone ("ME") AND your PC's speaker output ("THEM"),
-//     each in its own live transcription session, so lines are labeled.
-//   - Saves every transcribed line to a text file in Documents\MeetingTranscripts.
+//   - Captures your microphone AND your PC's speaker output, mixed into one stream
+//     (Foundry Local allows only one live session). Each line is labeled ME or THEM
+//     by which source was louder while it was spoken.
+//   - Saves every transcribed line to a text file in C:\Users\Dlee\Local\Records.
 //   - Keeps the downloaded model by default (no "delete model?" prompt).
 //     Set FOUNDRY_LOCAL_CLEANUP_MODEL=true if you ever want it deleted.
 //   - Run with --mic-only to transcribe just your microphone.
@@ -57,7 +58,8 @@ if (WaveIn.DeviceCount == 0)
 }
 
 // --- Transcript file ---
-var transcriptDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "MeetingTranscripts");
+// Change this path if you want transcripts saved somewhere else.
+var transcriptDir = @"C:\Users\Dlee\Local\Records";
 Directory.CreateDirectory(transcriptDir);
 var transcriptPath = Path.Combine(transcriptDir, $"meeting_{DateTime.Now:yyyy-MM-dd_HHmm}.txt");
 var transcript = new StreamWriter(transcriptPath, append: true) { AutoFlush = true };
@@ -143,57 +145,28 @@ try
 
     var audioClient = await model.GetAudioClientAsync();
 
-    // ======================= MICROPHONE (ME) =======================
-    var micSession = audioClient.CreateLiveTranscriptionSession();
-    micSession.Settings.SampleRate = SampleRate;
-    micSession.Settings.Channels = 1;
-    micSession.Settings.Language = language;
-    await micSession.StartAsync(CancellationToken.None);
+    // Foundry Local allows only ONE live session at a time, so both sources are
+    // mixed into a single stream. To still label who spoke, the app remembers how
+    // loud the mic and the PC audio were for every 100 ms of the stream, then labels
+    // each transcribed line by whichever source was louder while it was spoken.
+    var session = audioClient.CreateLiveTranscriptionSession();
+    session.Settings.SampleRate = SampleRate;
+    session.Settings.Channels = 1;
+    session.Settings.Language = language;
+    await session.StartAsync(CancellationToken.None);
 
-    var micChannel = Channel.CreateBounded<byte[]>(new BoundedChannelOptions(50) { FullMode = BoundedChannelFullMode.DropOldest });
-    var micAppendTask = PumpAudio(micChannel, micSession);
-    var micReadTask = ReadResults(micSession, "ME", ConsoleColor.Green);
+    var audioChannel = Channel.CreateBounded<byte[]>(new BoundedChannelOptions(50) { FullMode = BoundedChannelFullMode.DropOldest });
+    var appendTask = PumpAudio(audioChannel, session);
+    var loudness = new LoudnessLog();
+    var readTask = ReadResults(session, loudness, micOnly);
 
-    using var waveIn = new WaveIn
-    {
-        WaveFormat = new WaveFormat(SampleRate, 16, 1),
-        BufferMilliseconds = 100
-    };
-    waveIn.DataAvailable += (_, e) =>
-    {
-        if (e.BytesRecorded <= 0)
-        {
-            return;
-        }
-
-        var buffer = new byte[e.BytesRecorded];
-        Buffer.BlockCopy(e.Buffer, 0, buffer, 0, e.BytesRecorded);
-        micChannel.Writer.TryWrite(buffer);
-    };
-
-    // ======================= PC AUDIO (THEM) =======================
+    // ----- PC audio (THEM): converted to 16 kHz mono and held until the mic asks for it -----
     WasapiLoopbackCapture? loopback = null;
-    Channel<byte[]>? pcChannel = null;
-    Task? pcAppendTask = null, pcReadTask = null, pcSilenceTask = null;
-    var pcSession = (Microsoft.AI.Foundry.Local.OpenAI.LiveAudioTranscriptionSession?)null;
-    using var stopSilence = new CancellationTokenSource();
-
+    BufferedWaveProvider? pcBuffer = null;
     if (!micOnly)
     {
         try
         {
-            pcSession = audioClient.CreateLiveTranscriptionSession();
-            pcSession.Settings.SampleRate = SampleRate;
-            pcSession.Settings.Channels = 1;
-            pcSession.Settings.Language = language;
-            await pcSession.StartAsync(CancellationToken.None);
-
-            pcChannel = Channel.CreateBounded<byte[]>(new BoundedChannelOptions(50) { FullMode = BoundedChannelFullMode.DropOldest });
-            pcAppendTask = PumpAudio(pcChannel, pcSession);
-            pcReadTask = ReadResults(pcSession, "THEM", ConsoleColor.Yellow);
-
-            // Windows gives speaker audio in its own format (usually 48 kHz, 32-bit float, stereo).
-            // Convert it to 16 kHz, 16-bit, mono — the format the session expects.
             loopback = new WasapiLoopbackCapture();
             var src = loopback.WaveFormat;
             if (src.BitsPerSample != 32 && src.BitsPerSample != 16)
@@ -207,9 +180,14 @@ try
                 DiscardOnBufferOverflow = true
             };
             var converted = new WdlResamplingSampleProvider(monoBuffer.ToSampleProvider(), SampleRate).ToWaveProvider16();
+            // Windows sends nothing while the PC is silent; ReadFully makes gaps read as silence.
+            pcBuffer = new BufferedWaveProvider(new WaveFormat(SampleRate, 16, 1), TimeSpan.FromSeconds(10))
+            {
+                ReadFully = true,
+                DiscardOnBufferOverflow = true
+            };
+            var pcBufferLocal = pcBuffer;
             var readBuffer = new byte[ChunkBytes];
-            var lastPcAudio = DateTime.UtcNow;
-            var pcChannelLocal = pcChannel;
 
             loopback.DataAvailable += (_, e) =>
             {
@@ -218,45 +196,58 @@ try
                     return;
                 }
 
-                lastPcAudio = DateTime.UtcNow;
                 var mono = ToMonoFloatBytes(e.Buffer, e.BytesRecorded, src.Channels, src.BitsPerSample);
                 monoBuffer.AddSamples(mono, 0, mono.Length);
-
                 int n;
                 while ((n = converted.Read(readBuffer.AsSpan())) > 0)
                 {
-                    var chunk = new byte[n];
-                    Buffer.BlockCopy(readBuffer, 0, chunk, 0, n);
-                    pcChannelLocal.Writer.TryWrite(chunk);
+                    pcBufferLocal.AddSamples(readBuffer, 0, n);
                 }
             };
-
-            // Windows sends nothing while the PC is silent. Feed silence during those gaps
-            // so the model knows the speaker stopped and finishes the sentence.
-            pcSilenceTask = Task.Run(async () =>
-            {
-                var silence = new byte[ChunkBytes];
-                while (!stopSilence.IsCancellationRequested)
-                {
-                    try { await Task.Delay(100, stopSilence.Token); } catch (OperationCanceledException) { break; }
-                    if (DateTime.UtcNow - lastPcAudio > TimeSpan.FromMilliseconds(300))
-                    {
-                        pcChannelLocal.Writer.TryWrite(silence);
-                    }
-                }
-            });
         }
         catch (Exception ex)
         {
             Console.ForegroundColor = ConsoleColor.Red;
-            Console.WriteLine($"Could not start PC-audio transcription: {ex.Message}");
+            Console.WriteLine($"Could not capture PC audio: {ex.Message}");
             Console.WriteLine("Continuing with microphone only.");
             Console.ResetColor();
             loopback?.Dispose();
             loopback = null;
-            stopSilence.Cancel();
+            pcBuffer = null;
         }
     }
+
+    // ----- Microphone (ME): its steady timing paces the mix -----
+    using var waveIn = new WaveIn
+    {
+        WaveFormat = new WaveFormat(SampleRate, 16, 1),
+        BufferMilliseconds = 100
+    };
+    waveIn.DataAvailable += (_, e) =>
+    {
+        if (e.BytesRecorded <= 0)
+        {
+            return;
+        }
+
+        var mic = new byte[e.BytesRecorded];
+        Buffer.BlockCopy(e.Buffer, 0, mic, 0, e.BytesRecorded);
+
+        var pc = new byte[e.BytesRecorded];
+        if (pcBuffer is not null)
+        {
+            // If PC audio has piled up (clock drift), drop the backlog so it stays in sync.
+            if (pcBuffer.BufferedDuration > TimeSpan.FromMilliseconds(500))
+            {
+                pcBuffer.ClearBuffer();
+            }
+
+            pcBuffer.Read(pc.AsSpan());
+        }
+
+        loudness.Add(Rms(mic), Rms(pc), e.BytesRecorded / 2);
+        audioChannel.Writer.TryWrite(Mix(mic, pc));
+    };
 
     Console.WriteLine();
     Console.WriteLine("===========================================================");
@@ -269,8 +260,8 @@ try
 
     try
     {
-        waveIn.StartRecording();
         loopback?.StartRecording();
+        waveIn.StartRecording();
     }
     catch (Exception ex)
     {
@@ -283,19 +274,10 @@ try
     // --- Shut down cleanly: stop capture, flush audio, collect last results ---
     waveIn.StopRecording();
     loopback?.StopRecording();
-    stopSilence.Cancel();
-
-    micChannel.Writer.Complete();
-    pcChannel?.Writer.Complete();
-    await micAppendTask;
-    if (pcAppendTask is not null) await pcAppendTask;
-    if (pcSilenceTask is not null) await pcSilenceTask;
-
-    await micSession.StopAsync(CancellationToken.None);
-    if (pcSession is not null) await pcSession.StopAsync(CancellationToken.None);
-    await micReadTask;
-    if (pcReadTask is not null) await pcReadTask;
-
+    audioChannel.Writer.Complete();
+    await appendTask;
+    await session.StopAsync(CancellationToken.None);
+    await readTask;
     loopback?.Dispose();
 }
 finally
@@ -330,8 +312,8 @@ static Task PumpAudio(Channel<byte[]> channel, Microsoft.AI.Foundry.Local.OpenAI
         }
     });
 
-// Prints each transcribed piece of text with its label and saves it to the file.
-Task ReadResults(Microsoft.AI.Foundry.Local.OpenAI.LiveAudioTranscriptionSession session, string label, ConsoleColor color) =>
+// Prints each transcribed line, labeled by whichever source was louder, and saves it.
+Task ReadResults(Microsoft.AI.Foundry.Local.OpenAI.LiveAudioTranscriptionSession session, LoudnessLog loudness, bool micOnlyMode) =>
     Task.Run(async () =>
     {
         try
@@ -339,16 +321,46 @@ Task ReadResults(Microsoft.AI.Foundry.Local.OpenAI.LiveAudioTranscriptionSession
             await foreach (var result in session.GetStream(CancellationToken.None))
             {
                 var text = result.Content?[0]?.Text?.Trim();
-                if (result.IsFinal && !string.IsNullOrEmpty(text))
+                if (!result.IsFinal || string.IsNullOrEmpty(text))
                 {
-                    PrintLine(label, color, text);
+                    continue;
                 }
+
+                var isMe = micOnlyMode || loudness.MicWasLouder(result.StartTime, result.EndTime);
+                PrintLine(isMe ? "ME" : "THEM", isMe ? ConsoleColor.Green : ConsoleColor.Yellow, text);
             }
         }
         catch (OperationCanceledException)
         {
         }
     });
+
+// Mixes two 16-bit mono buffers of equal length.
+static byte[] Mix(byte[] a, byte[] b)
+{
+    var output = new byte[a.Length];
+    for (var i = 0; i + 1 < a.Length; i += 2)
+    {
+        var sum = BitConverter.ToInt16(a, i) + BitConverter.ToInt16(b, i);
+        BitConverter.TryWriteBytes(output.AsSpan(i, 2), (short)Math.Clamp(sum, short.MinValue, short.MaxValue));
+    }
+
+    return output;
+}
+
+// Loudness (root mean square) of a 16-bit mono buffer.
+static double Rms(byte[] pcm)
+{
+    double sum = 0;
+    var count = pcm.Length / 2;
+    for (var i = 0; i + 1 < pcm.Length; i += 2)
+    {
+        double v = BitConverter.ToInt16(pcm, i);
+        sum += v * v;
+    }
+
+    return count == 0 ? 0 : Math.Sqrt(sum / count);
+}
 
 // Averages all channels into one and returns 32-bit float samples as bytes.
 static byte[] ToMonoFloatBytes(byte[] data, int byteCount, int channels, int bitsPerSample)
@@ -375,3 +387,43 @@ static byte[] ToMonoFloatBytes(byte[] data, int byteCount, int channels, int bit
 
 static string? FirstNonEmpty(params string?[] values) =>
     values.FirstOrDefault(static value => !string.IsNullOrWhiteSpace(value));
+
+// Remembers mic vs PC loudness for each chunk of the stream, so a transcribed
+// line can be matched back to whoever was talking at that moment.
+sealed class LoudnessLog
+{
+    private readonly object _lock = new();
+    private readonly List<(double Start, double End, double Mic, double Pc)> _chunks = new();
+    private double _position; // seconds of audio sent so far
+
+    public void Add(double micRms, double pcRms, int samples)
+    {
+        lock (_lock)
+        {
+            var end = _position + samples / 16000.0;
+            _chunks.Add((_position, end, micRms, pcRms));
+            _position = end;
+        }
+    }
+
+    public bool MicWasLouder(double? start, double? end)
+    {
+        lock (_lock)
+        {
+            // If the model doesn't report timing, use the last 3 seconds of audio.
+            var to = end ?? _position;
+            var from = start ?? to - 3.0;
+            double mic = 0, pc = 0;
+            foreach (var c in _chunks)
+            {
+                if (c.End > from && c.Start < to)
+                {
+                    mic += c.Mic;
+                    pc += c.Pc;
+                }
+            }
+
+            return mic >= pc;
+        }
+    }
+}
